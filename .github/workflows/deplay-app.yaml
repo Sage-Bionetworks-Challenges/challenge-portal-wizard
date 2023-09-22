@@ -1,0 +1,117 @@
+name: deploy-app
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  #   tags:
+  #     - v[0-9]+.[0-9]+.[0-9]+
+  #   paths-ignore:
+  #     - '**/*.md'
+  #     - '**/.gitignore'
+  workflow_dispatch:
+
+jobs:
+  shiny-deploy:
+    runs-on: ubuntu-latest
+    container: rocker/rstudio:4.1.2
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: r-lib/actions/setup-pandoc@v2
+    
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libpng-dev libxml2-dev
+          
+      - name: Install python
+        run: |
+          sudo apt-get install -y pip python3.8-venv
+          
+      - name: Set up virtual environment
+        # When shinyapps.io supports python 3.9+ split this into two steps
+        # to install schematic from pypi or github
+        shell: bash
+        run: |
+          python3 -m venv .venv
+          chmod 755 .venv/bin/activate
+          source .venv/bin/activate
+          
+      # - name: zip virtual env
+      #   shell: bash
+      #   # ShinyApps has a limit of 7000 files, far exceeded by the many Python dependencies
+      #   # that this app' has.  As a workaround we zip the virtual environment and later
+      #   # unzip it in 'global.R'
+      #   run: |
+      #     zip -rm .venv.zip .venv
+          
+      - uses: r-lib/actions/setup-renv@v2
+          
+      - name: shinyapps.io R pkg hack
+        # Delete files that makes shinyapps.io treat this like a golem app
+        shell: bash
+        run: |
+          cp R/* functions/
+          rm -r R/ DESCRIPTION NAMESPACE
+          
+      # - name: Write R environmental variables
+      #   shell: bash
+      #   run: |
+      #     echo 'DCA_CLIENT_ID="${{ secrets.OAUTH_CLIENT_ID }}"' >> .Renviron
+      #     echo 'DCA_CLIENT_SECRET="${{ secrets.OAUTH_CLIENT_SECRET }}"' >> .Renviron
+          
+      #     echo 'DCA_SCHEMATIC_API_TYPE="${{ env.DCA_SCHEMATIC_API_TYPE }}"' >> .Renviron
+      #     echo 'DCA_API_HOST="${{ env.DCA_API_HOST }}"' >> .Renviron
+
+      #     echo 'DCA_SYNAPSE_PROJECT_API=TRUE' >> .Renviron
+      #     echo 'DCA_DCC_CONFIG="https://raw.githubusercontent.com/Sage-Bionetworks/data_curator_config/shinyapps-io/dcc_config.csv"' >> .Renviron
+          
+      #     echo 'GITHUB_PAT="${{ secrets.GITHUB_TOKEN }}"' >> .Renviron
+
+      - name: Authorize and deploy app
+        shell: Rscript {0}
+        run: |
+          renv::restore()
+          install.packages("rsconnect")
+          
+          repo <- Sys.getenv("GITHUB_REPOSITORY")
+          appName <- strsplit(repo, "/")[[1]][2]
+          refName <- Sys.getenv("GITHUB_REF_NAME")
+          
+          # if tag is v*.*.*, deploy to prod, if main to staging, otherwise to test
+          if (grepl("v[0-9]+.[0-9]+.[0-9]+", refName)) {
+            message("Deploying release version of app")
+          } else if (refName %in% c("main")) {
+            appName <- paste(appName, "staging", sep = "-")
+            message("Deploying staging version of app")
+          } else {
+            appName <- paste(appName, "testing1", sep = "-")
+            message("Deploying testing version of app")
+          }
+          message(sprintf("Deploying to %s instance.", appName))
+          
+          rsConnectUser <- "${{ secrets.RSCONNECT_USER }}"
+          rsConnectToken <- "${{ secrets.RSCONNECT_TOKEN }}"
+          rsConnectSecret <- "${{ secrets.RSCONNECT_SECRET }}"
+          rsconnect::setAccountInfo(rsConnectUser, rsConnectToken, rsConnectSecret)
+          
+          # Set app URL for OAuth
+          appUrl <- sprintf("https://%s.shinyapps.io/%s", rsConnectUser, appName)
+          renviron <- readLines(".Renviron")
+          renviron <- c(renviron, sprintf("DCA_APP_URL=%s", appUrl))
+          writeLines(renviron, ".Renviron") 
+          
+          # Get app names. If app exists, configure then deploy. Otherwise
+          # deploy then configure.
+
+          apps <- rsconnect::applications()$name
+          if (appName %in% apps) {
+            rsconnect::configureApp(appName = appName, size = "xxxlarge", logLevel = "verbose")
+            rsconnect::deployApp(appName = appName)
+          } else {
+            rsconnect::deployApp(appName = appName)
+            rsconnect::configureApp(appName = appName, size = "xxxlarge", logLevel = "verbose")
+          }
